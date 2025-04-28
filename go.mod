@@ -1,6 +1,7 @@
 module github.com/usememos/memos
 
 go 1.23
+toolchain go1.24.1
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.36.0
@@ -26,7 +27,7 @@ require (
 	github.com/usememos/gomark v0.0.0-20240928134159-9aca881d9121
 	golang.org/x/crypto v0.32.0
 	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c
-	golang.org/x/mod v0.22.0
+	golang.org/x/mod v0.24.0
 	golang.org/x/net v0.34.0
 	golang.org/x/oauth2 v0.23.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20241104194629-dd2ea8efbc28
