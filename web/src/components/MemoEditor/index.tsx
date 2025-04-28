@@ -2,7 +2,8 @@ import { Select, Option, Divider } from "@mui/joy";
 import { Button } from "@usememos/mui";
 import { isEqual } from "lodash-es";
 import { LoaderIcon, SendIcon } from "lucide-react";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+// Added `useCallback` for the effect dependency
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import DatePicker from "react-datepicker";
 import "react-datepicker/dist/react-datepicker.css";
 import { toast } from "react-hot-toast";
@@ -29,10 +30,14 @@ import MarkdownMenu from "./ActionButton/MarkdownMenu";
 import TagSelector from "./ActionButton/TagSelector";
 import UploadResourceButton from "./ActionButton/UploadResourceButton";
 import Editor, { EditorRefActions } from "./Editor";
+// Import the type for the callback parameters
+import { SlashCommandUpdateParams } from "./Editor";
+import SlashCommandSuggestions from "./SlashCommandSuggestions"; // Assuming we create this component
 import RelationListView from "./RelationListView";
 import ResourceListView from "./ResourceListView";
 import { handleEditorKeydownWithMarkdownShortcuts, hyperlinkHighlightedText } from "./handlers";
 import { MemoEditorContext } from "./types";
+
 
 export interface Props {
   className?: string;
@@ -47,6 +52,16 @@ export interface Props {
   onCancel?: () => void;
 }
 
+// Define command structure type
+interface SlashCommand {
+  command: string;
+  label: string;
+  description?: string; // Made optional
+  actionPrefix?: string;
+  actionSuffix?: string;
+  // Add other action types if needed, e.g., a function to call
+}
+
 interface State {
   memoVisibility: Visibility;
   resourceList: Resource[];
@@ -55,7 +70,26 @@ interface State {
   isUploadingResource: boolean;
   isRequesting: boolean;
   isComposing: boolean;
+  // State for slash commands (v0.24.0 didn't have isDraggingFile)
+  showSlashSuggestions: boolean;
+  slashQuery: string;
+  suggestionsPosition: { top: number; left: number; height: number } | null;
+  filteredCommands: SlashCommand[]; // Use the defined type
+  selectedSuggestionIndex: number;
 }
+
+// Define available commands outside the component or memoize it
+const availableCommands: SlashCommand[] = [
+  { command: 'todo', label: 'Todo List', description: 'Create a checklist item', actionPrefix: '- [ ] ' },
+  { command: 'h1', label: 'Heading 1', description: 'Large section heading', actionPrefix: '# ' },
+  { command: 'h2', label: 'Heading 2', description: 'Medium section heading', actionPrefix: '## ' },
+  { command: 'h3', label: 'Heading 3', description: 'Small section heading', actionPrefix: '### ' },
+  { command: 'ul', label: 'Bulleted List', description: 'Create a bulleted list', actionPrefix: '- ' },
+  // { command: 'ol', label: 'Numbered List', description: 'Create a numbered list', actionPrefix: '1. ' }, // Removed Numbered List
+  { command: 'quote', label: 'Quote', description: 'Capture a quote', actionPrefix: '> ' },
+  { command: 'code', label: 'Code Block', description: 'Capture a code snippet', actionPrefix: '```\n', actionSuffix: '\n```' },
+  // Add more commands as needed
+];
 
 const MemoEditor = (props: Props) => {
   const { className, cacheKey, memoName, parentMemoName, autoFocus, onConfirm, onCancel } = props;
@@ -74,10 +108,17 @@ const MemoEditor = (props: Props) => {
     isUploadingResource: false,
     isRequesting: false,
     isComposing: false,
+    // Initialize slash command state
+    showSlashSuggestions: false,
+    slashQuery: "",
+    suggestionsPosition: null,
+    filteredCommands: [],
+    selectedSuggestionIndex: 0,
   });
   const [displayTime, setDisplayTime] = useState<Date | undefined>();
   const [hasContent, setHasContent] = useState<boolean>(false);
   const editorRef = useRef<EditorRefActions>(null);
+  const editorContainerRef = useRef<HTMLDivElement>(null); // Ref for the main container
   const userSetting = userStore.userSetting as UserSetting;
   const contentCacheKey = `${currentUser.name}-${cacheKey || ""}`;
   const [contentCache, setContentCache] = useLocalStorage<string>(contentCacheKey, "");
@@ -90,6 +131,30 @@ const MemoEditor = (props: Props) => {
   const workspaceMemoRelatedSetting =
     workspaceSettingStore.getWorkspaceSettingByKey(WorkspaceSettingKey.MEMO_RELATED)?.memoRelatedSetting ||
     WorkspaceMemoRelatedSetting.fromPartial({});
+
+  // Effect to handle clicks outside the editor to close suggestions
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      // If suggestions are shown and the click target is outside the editor container
+      if (state.showSlashSuggestions && editorContainerRef.current && !editorContainerRef.current.contains(event.target as Node)) {
+        setState(s => ({ ...s, showSlashSuggestions: false }));
+      }
+    };
+
+    // Add listener when suggestions are shown
+    if (state.showSlashSuggestions) {
+      document.addEventListener('mousedown', handleClickOutside);
+    } else {
+      // Remove listener when suggestions are hidden
+      document.removeEventListener('mousedown', handleClickOutside);
+    }
+
+    // Cleanup listener on component unmount
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [state.showSlashSuggestions]); // Rerun effect when showSlashSuggestions changes
+
 
   useEffect(() => {
     editorRef.current?.setContent(contentCache || "");
@@ -149,6 +214,13 @@ const MemoEditor = (props: Props) => {
   };
 
   const handleKeyDown = (event: React.KeyboardEvent) => {
+     // Prevent slash command key handling here if suggestions are shown
+    // The Editor component's onSlashCommandUpdate will handle it first
+    if (state.showSlashSuggestions && ["ArrowUp", "ArrowDown", "Enter", "Escape", "Tab"].includes(event.key)) {
+        // Let the callback handle prevention
+        return;
+    }
+
     if (!editorRef.current) {
       return;
     }
@@ -227,8 +299,12 @@ const MemoEditor = (props: Props) => {
     } catch (error: any) {
       console.error(error);
       toast.error(error.details);
+    } finally {
+       // Ensure uploading state is reset even on error
+       setState((state) => ({ ...state, isUploadingResource: false }));
     }
   };
+
 
   const uploadMultiFiles = async (files: FileList) => {
     const uploadedResourceList: Resource[] = [];
@@ -339,6 +415,8 @@ const MemoEditor = (props: Props) => {
             if (onCancel) {
               onCancel();
             }
+            // Need to reset requesting state even if no changes
+            setState((s) => ({ ...s, isRequesting: false }));
             return;
           }
           const memo = await memoStore.updateMemo(memoPatch, Array.from(updateMask));
@@ -379,22 +457,28 @@ const MemoEditor = (props: Props) => {
     } catch (error: any) {
       console.error(error);
       toast.error(error.details);
+    } finally {
+        localStorage.removeItem(contentCacheKey);
+        setState((s) => {
+          return {
+            ...s,
+            isRequesting: false,
+            resourceList: [],
+            relationList: [],
+            location: undefined,
+            // Reset slash command state on save/error
+            showSlashSuggestions: false,
+            slashQuery: "",
+            filteredCommands: [],
+            selectedSuggestionIndex: 0,
+          };
+        });
     }
-
-    localStorage.removeItem(contentCacheKey);
-    setState((state) => {
-      return {
-        ...state,
-        isRequesting: false,
-        resourceList: [],
-        relationList: [],
-        location: undefined,
-      };
-    });
   };
 
   const handleCancelBtnClick = () => {
     localStorage.removeItem(contentCacheKey);
+    setState(s => ({ ...s, showSlashSuggestions: false })); // Hide suggestions on cancel
 
     if (onCancel) {
       onCancel();
@@ -415,6 +499,115 @@ const MemoEditor = (props: Props) => {
     }),
     [i18n.language],
   );
+
+  // Callback function to handle updates from the Editor component regarding slash commands
+  const handleSlashCommandUpdate = useCallback((params: SlashCommandUpdateParams) => {
+    const { show, query, position, keyEvent } = params;
+
+    if (!show) {
+      // Only update state if suggestions are currently shown
+      if (state.showSlashSuggestions) {
+        setState(s => ({ ...s, showSlashSuggestions: false }));
+      }
+      return;
+    }
+
+    // Filter commands based on the query
+    const lowerQuery = query.toLowerCase();
+    const filtered = availableCommands.filter(cmd => cmd.command.toLowerCase().startsWith(lowerQuery));
+
+    // Handle keyboard events for navigation/selection
+    if (keyEvent) {
+      // Only handle keys if suggestions are currently visible and there are commands to select
+      if (state.showSlashSuggestions && filtered.length > 0) {
+        let newIndex = state.selectedSuggestionIndex;
+        let shouldPreventDefault = false; // Flag to track if we should prevent default
+
+        if (keyEvent.key === "ArrowDown") {
+          newIndex = (state.selectedSuggestionIndex + 1) % filtered.length;
+          shouldPreventDefault = true;
+        } else if (keyEvent.key === "ArrowUp") {
+          newIndex = (state.selectedSuggestionIndex - 1 + filtered.length) % filtered.length;
+          shouldPreventDefault = true;
+        } else if (keyEvent.key === "Enter" || keyEvent.key === "Tab") {
+          // Only prevent default if we actually execute a command
+          if (state.filteredCommands[state.selectedSuggestionIndex]) {
+            shouldPreventDefault = true;
+            executeSlashCommand(state.filteredCommands[state.selectedSuggestionIndex]);
+            // Hide suggestions after execution handled in executeSlashCommand
+            keyEvent.preventDefault(); // Prevent default ONLY when executing command
+            return; // Command executed
+          }
+        } else if (keyEvent.key === "Escape") {
+          shouldPreventDefault = true;
+          // Hide suggestions on escape
+          setState(s => ({ ...s, showSlashSuggestions: false }));
+          keyEvent.preventDefault(); // Prevent default for Escape
+          return;
+        }
+
+        // Update selected index if changed
+        if (newIndex !== state.selectedSuggestionIndex) {
+            setState(s => ({ ...s, selectedSuggestionIndex: newIndex }));
+        }
+        // Prevent default if needed for navigation keys
+        if (shouldPreventDefault) {
+            keyEvent.preventDefault();
+        }
+      }
+      // Removed the 'else if' block that handled Enter/Tab immediately after typing '/'
+    } else {
+      // Update state based on input change (no key event)
+      // Only show if there are matches
+      const shouldShow = filtered.length > 0;
+      setState(s => ({
+        ...s,
+        showSlashSuggestions: shouldShow,
+        slashQuery: query,
+        filteredCommands: filtered,
+        // Reset index only if query changes or suggestions are newly shown
+        selectedSuggestionIndex: (s.slashQuery !== query || !s.showSlashSuggestions) ? 0 : s.selectedSuggestionIndex,
+        // Update position only if suggestions are shown
+        suggestionsPosition: shouldShow ? (position || s.suggestionsPosition) : null,
+      }));
+    }
+  }, [state.showSlashSuggestions, state.selectedSuggestionIndex, state.filteredCommands, state.slashQuery]); // Added dependencies for the callback
+
+
+  // Function to execute the selected slash command
+  const executeSlashCommand = useCallback((command: SlashCommand | undefined) => {
+    if (!editorRef.current || !command) return;
+
+    const editor = editorRef.current.getEditor();
+    if (!editor) return;
+
+    const currentPos = editor.selectionStart;
+    const textBefore = editor.value.substring(0, currentPos);
+    // Find the start of the slash command we need to replace more reliably
+    const commandStartPos = textBefore.lastIndexOf(`/${state.slashQuery}`);
+
+    if (commandStartPos !== -1) {
+      // Ensure we are replacing the correct thing
+      const lengthToRemove = state.slashQuery.length + 1; // +1 for the '/'
+      if (textBefore.substring(commandStartPos, commandStartPos + lengthToRemove) === `/${state.slashQuery}`) {
+        editorRef.current.removeText(commandStartPos, lengthToRemove);
+        // Insert the command's action prefix/suffix
+        editorRef.current.insertText("", command.actionPrefix || "", command.actionSuffix || "");
+        // Adjust cursor position after insertion
+        const newCursorPos = commandStartPos + (command.actionPrefix?.length || 0);
+        if (command.actionSuffix) {
+           // If there's a suffix (like code block), place cursor between prefix and suffix
+           editorRef.current.setCursorPosition(newCursorPos);
+        } else {
+           // Otherwise, place cursor after the prefix
+           editorRef.current.setCursorPosition(newCursorPos);
+        }
+      }
+    }
+     // Hide suggestions after execution
+     setState(s => ({ ...s, showSlashSuggestions: false }));
+  }, [state.slashQuery]); // Added dependency
+
 
   const allowSave = (hasContent || state.resourceList.length > 0) && !state.isUploadingResource && !state.isRequesting;
 
@@ -438,16 +631,16 @@ const MemoEditor = (props: Props) => {
         memoName,
       }}
     >
+      {/* Attach ref to the main container */}
       <div
+        ref={editorContainerRef}
         className={`${
           className ?? ""
         } relative w-full flex flex-col justify-start items-start bg-white dark:bg-zinc-800 px-4 pt-4 rounded-lg border border-gray-200 dark:border-zinc-700`}
         tabIndex={0}
-        onKeyDown={handleKeyDown}
+        onKeyDown={handleKeyDown} // Keep existing keydown handler
         onDrop={handleDropEvent}
-        onFocus={handleEditorFocus}
-        onCompositionStart={handleCompositionStart}
-        onCompositionEnd={handleCompositionEnd}
+        // Removed onFocus, onCompositionStart, onCompositionEnd from here as they should be handled by the textarea
       >
         {memoName && displayTime && (
           <DatePicker
@@ -462,13 +655,33 @@ const MemoEditor = (props: Props) => {
             calendarClassName="ml-24 sm:ml-44"
           />
         )}
-        <Editor ref={editorRef} {...editorConfig} />
+        {/* Render Suggestions Box */}
+        {state.showSlashSuggestions && state.suggestionsPosition && (
+          <SlashCommandSuggestions
+            position={state.suggestionsPosition}
+            commands={state.filteredCommands}
+            selectedIndex={state.selectedSuggestionIndex}
+            // Pass execution function wrapped to handle potential undefined command
+            onSelect={(cmd: SlashCommand) => executeSlashCommand(cmd)} // Added type SlashCommand
+            onClose={() => setState(s => ({ ...s, showSlashSuggestions: false }))} // Allow closing via suggestion box itself
+          />
+        )}
+        {/* Pass the callback to Editor */}
+        <Editor
+          ref={editorRef}
+          {...editorConfig}
+          onSlashCommandUpdate={handleSlashCommandUpdate}
+          // Pass composition handlers to the underlying textarea via Editor props if needed, or handle within Editor itself
+          // onCompositionStart={handleCompositionStart}
+          // onCompositionEnd={handleCompositionEnd}
+         />
         <ResourceListView resourceList={state.resourceList} setResourceList={handleSetResourceList} />
         <RelationListView relationList={referenceRelations} setRelationList={handleSetRelationList} />
         <div className="relative w-full flex flex-row justify-between items-center pt-2" onFocus={(e) => e.stopPropagation()}>
           <div className="flex flex-row justify-start items-center opacity-80 dark:opacity-60 -space-x-1">
             <TagSelector editorRef={editorRef} />
             <MarkdownMenu editorRef={editorRef} />
+            {/* UploadResourceButton in v0.24.0 manages its own state */}
             <UploadResourceButton />
             <AddMemoRelationPopover editorRef={editorRef} />
             {workspaceMemoRelatedSetting.enableLocation && (
